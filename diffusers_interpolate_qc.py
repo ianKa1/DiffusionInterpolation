@@ -9,6 +9,7 @@ Date: 2024
 """
 
 import os
+import hashlib
 import shutil
 from typing import Optional, Tuple, List, Union
 
@@ -39,16 +40,6 @@ from torchvision import transforms
 
 
 class DiffusersInterpolator:
-    """
-    Hierarchical bisection interpolation with quality control using HuggingFace Diffusers.
-
-    Example:
-        >>> interpolator = DiffusersInterpolator()
-        >>> img1 = Image.open('apple.png')
-        >>> img2 = Image.open('banana.png')
-        >>> results = interpolator.interpolate_qc(img1, img2, num_frames=17)
-    """
-
     def __init__(
         self,
         model_id: str = "runwayml/stable-diffusion-v1-5",
@@ -96,36 +87,21 @@ class DiffusersInterpolator:
 
         # Load VAE
         print("  Loading VAE...")
-        self.vae = AutoencoderKL.from_pretrained(
-            model_id,
-            subfolder="vae",
-            torch_dtype=dtype
-        ).to(device)
+        self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype).to(device)
         self.vae.eval()
 
         # Load UNet
         print("  Loading UNet...")
-        self.unet = UNet2DConditionModel.from_pretrained(
-            model_id,
-            subfolder="unet",
-            torch_dtype=dtype
-        ).to(device)
+        self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet", torch_dtype=dtype).to(device)
         self.unet.eval()
 
         # Load Text Encoder
         print("  Loading Text Encoder...")
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model_id,
-            subfolder="text_encoder",
-            torch_dtype=dtype
-        ).to(device)
+        self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
         self.text_encoder.eval()
 
         # Load Tokenizer
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            model_id,
-            subfolder="tokenizer"
-        )
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
         # Load ControlNet if specified
         self.controlnet = None
@@ -486,7 +462,8 @@ class DiffusersInterpolator:
         n_prompt: str,
         num_iters: int = 200,
         lr: float = 1e-4,
-        guide_scale: float = 7.5
+        guide_scale: float = 7.5,
+        cache_path: Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Optimize text embeddings to reconstruct images (textual inversion).
@@ -505,6 +482,15 @@ class DiffusersInterpolator:
         Returns:
             (cond1, cond2, uncond): Optimized embeddings for img1, img2, and negative
         """
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading cached embeddings from {cache_path}")
+            state = torch.load(cache_path, map_location=self.device)
+            return (
+                state['cond1'].to(self.dtype),
+                state['cond2'].to(self.dtype),
+                state['uncond'].to(self.dtype),
+            )
+
         print(f"Optimizing text embeddings ({num_iters} iterations)...")
 
         # Data augmentation (prevents overfitting)
@@ -520,10 +506,10 @@ class DiffusersInterpolator:
             cond_base = self._encode_prompt(prompt)
             uncond_base = self._encode_prompt(n_prompt)
 
-        # Create learnable copies
-        cond1 = cond_base.clone().detach().requires_grad_(True)
-        cond2 = cond_base.clone().detach().requires_grad_(True)
-        uncond = uncond_base.clone().detach().requires_grad_(True)
+        # Create learnable copies in fp32 so Adam doesn't overflow on fp16
+        cond1 = cond_base.float().clone().detach().requires_grad_(True)
+        cond2 = cond_base.float().clone().detach().requires_grad_(True)
+        uncond = uncond_base.float().clone().detach().requires_grad_(True)
 
         # Optimizer
         optimizer = torch.optim.Adam([cond1, cond2, uncond], lr=lr)
@@ -554,8 +540,8 @@ class DiffusersInterpolator:
             sqrt_one_minus_alpha = (1 - alphas_cumprod[t]) ** 0.5
             noisy_L1 = sqrt_alpha * L1 + sqrt_one_minus_alpha * noise
 
-            # Predict noise using current cond1
-            text_emb = torch.cat([uncond, cond1])
+            # Predict noise using current cond1 (cast to model dtype for UNet)
+            text_emb = torch.cat([uncond, cond1]).to(self.dtype)
             latent_input = torch.cat([noisy_L1, noisy_L1])
             t_tensor = torch.tensor([t] * 2, device=self.device, dtype=torch.long)
 
@@ -566,14 +552,13 @@ class DiffusersInterpolator:
                 encoder_hidden_states=text_emb,
             ).sample
 
-            # Apply CFG
-            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            # Apply CFG and compute loss in fp32 to avoid overflow
+            noise_pred_uncond, noise_pred_cond = noise_pred.float().chunk(2)
             noise_pred_guided = noise_pred_uncond + guide_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
 
-            # Loss: MSE between predicted and true noise
-            loss1 = torch.nn.functional.mse_loss(noise_pred_guided, noise)
+            loss1 = torch.nn.functional.mse_loss(noise_pred_guided, noise.float())
 
             # === Optimize embedding for img2 ===
 
@@ -585,7 +570,7 @@ class DiffusersInterpolator:
             noise = torch.randn_like(L2)
             noisy_L2 = sqrt_alpha * L2 + sqrt_one_minus_alpha * noise
 
-            text_emb = torch.cat([uncond, cond2])
+            text_emb = torch.cat([uncond, cond2]).to(self.dtype)
             latent_input = torch.cat([noisy_L2, noisy_L2])
 
             noise_pred = self.unet(
@@ -594,12 +579,12 @@ class DiffusersInterpolator:
                 encoder_hidden_states=text_emb,
             ).sample
 
-            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred_uncond, noise_pred_cond = noise_pred.float().chunk(2)
             noise_pred_guided = noise_pred_uncond + guide_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
 
-            loss2 = torch.nn.functional.mse_loss(noise_pred_guided, noise)
+            loss2 = torch.nn.functional.mse_loss(noise_pred_guided, noise.float())
 
             # Backprop and update
             total_loss = loss1 + loss2
@@ -608,13 +593,17 @@ class DiffusersInterpolator:
             optimizer.zero_grad()
 
             # Log progress
-            if iteration % 50 == 0:
+            if iteration % 10 == 0:
                 print(f"  Iter {iteration}/{num_iters}: "
                       f"loss1={loss1.item():.4f}, loss2={loss2.item():.4f}")
 
         print(f"✓ Optimization complete!")
 
-        return cond1.detach(), cond2.detach(), uncond.detach()
+        result = (cond1.detach().to(self.dtype), cond2.detach().to(self.dtype), uncond.detach().to(self.dtype))
+        if cache_path:
+            torch.save({'cond1': result[0], 'cond2': result[1], 'uncond': result[2]}, cache_path)
+            print(f"Saved embeddings to {cache_path}")
+        return result
 
     @torch.no_grad()
     def _evaluate_with_clip(
@@ -753,9 +742,16 @@ class DiffusersInterpolator:
 
         # Textual inversion (optional)
         if optimize_cond > 0:
+            h = hashlib.md5()
+            h.update(np.array(img1).tobytes())
+            h.update(np.array(img2).tobytes())
+            h.update(f"{prompt}|{n_prompt}|{optimize_cond}|{cond_lr}|{guide_scale}|{self.model_id}".encode())
+            cache_path = os.path.join(out_dir, f"embeddings_{h.hexdigest()}.pt")
+
             cond1, cond2, uncond = self._optimize_embeddings(
                 img1, img2, prompt, n_prompt,
-                num_iters=optimize_cond, lr=cond_lr, guide_scale=guide_scale
+                num_iters=optimize_cond, lr=cond_lr, guide_scale=guide_scale,
+                cache_path=cache_path,
             )
             print()
         else:
@@ -793,82 +789,83 @@ class DiffusersInterpolator:
                 print(f"  Frames to generate: {len(range(df, num_frames-1, df*2))}")
 
                 for frame_ix in range(df, num_frames - 1, df * 2):
-                frac = frame_ix / (num_frames - 1)
+                    frac = frame_ix / (num_frames - 1)
 
-                print(f"    Generating frame {frame_ix}/{num_frames-1} (α={frac:.3f})...")
+                    print(f"    Generating frame {frame_ix}/{num_frames-1} (α={frac:.3f})...")
 
-                # Interpolate text conditioning
-                cond_interp = interp_fn(cond1, cond2, frac)
-                text_emb = torch.cat([uncond, cond_interp])
+                    # Interpolate text conditioning
+                    cond_interp = interp_fn(cond1, cond2, frac)
+                    text_emb = torch.cat([uncond, cond_interp])
 
-                # Generate N candidates
-                candidates = []
-                clip_scores = []
+                    # Generate N candidates
+                    candidates = []
+                    clip_scores = []
 
-                for choice_ix in range(n_choices):
-                    # Add noise to neighboring final_latents
-                    noise = torch.randn_like(final_latents[0])
+                    for choice_ix in range(n_choices):
+                        # Add noise to neighboring final_latents
+                        noise = torch.randn_like(final_latents[0])
 
-                    alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
-                    sqrt_alpha = (alphas_cumprod[t] ** 0.5).item()
-                    sqrt_one_minus = ((1 - alphas_cumprod[t]) ** 0.5).item()
+                        alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+                        sqrt_alpha = (alphas_cumprod[t] ** 0.5).item()
+                        sqrt_one_minus = ((1 - alphas_cumprod[t]) ** 0.5).item()
 
-                    # Noise the neighbors
-                    l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
-                    l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
+                        # Noise the neighbors
+                        l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
+                        l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
 
-                    # Interpolate
-                    noisy_latent = interp_fn(l1, l2, 0.5)
+                        # Interpolate
+                        noisy_latent = interp_fn(l1, l2, 0.5)
 
-                    # Denoise from cur_step to 0
-                    for step_idx in range(cur_step, -1, -1):
-                        t_cur = int(timesteps[step_idx])
-                        noisy_latent = self._denoise_step(
-                            noisy_latent, text_emb, t_cur, guide_scale
-                        )
-
-                    candidates.append(noisy_latent)
-
-                    # Decode and evaluate
-                    image = self._decode_latent(noisy_latent)
-
-                    if qc_prompts:
-                        # Automatic CLIP scoring
-                        score = self._evaluate_with_clip(
-                            image, qc_prompts[0], qc_prompts[1]
-                        )
-                        clip_scores.append(score)
-                    else:
-                        # Manual selection - save all candidates
-                        image.save(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
-
-                # Select best candidate
-                if qc_prompts:
-                    best_idx = int(np.argmax(clip_scores))
-                    print(f"      Selected candidate {best_idx} "
-                          f"(score: {clip_scores[best_idx]:.4f})")
-
-                    image = self._decode_latent(candidates[best_idx])
-                    image.save(f'{out_dir}/{frame_ix:03d}.png')
-
-                else:
-                    # Manual selection
-                    print(f"      Saved {n_choices} candidates. Choose 0-{n_choices-1}:")
-                    choice = int(input("      Choice: "))
-                    best_idx = choice
-
-                    # Clean up non-selected candidates
-                    for i in range(n_choices):
-                        if i != choice:
-                            os.remove(f'{out_dir}/{frame_ix:03d}_{i}.png')
-                        else:
-                            os.rename(
-                                f'{out_dir}/{frame_ix:03d}_{i}.png',
-                                f'{out_dir}/{frame_ix:03d}.png'
+                        # Denoise: timesteps is descending (high noise → low noise),
+                        # so iterate from cur_step UP to the end of the schedule.
+                        for step_idx in range(cur_step, len(timesteps)):
+                            t_cur = int(timesteps[step_idx])
+                            noisy_latent = self._denoise_step(
+                                noisy_latent, text_emb, t_cur, guide_scale
                             )
 
-                # Cache the selected latent
-                final_latents[frame_ix] = candidates[best_idx]
+                        candidates.append(noisy_latent)
+
+                        # Decode and evaluate
+                        image = self._decode_latent(noisy_latent)
+
+                        if qc_prompts:
+                            # Automatic CLIP scoring
+                            score = self._evaluate_with_clip(
+                                image, qc_prompts[0], qc_prompts[1]
+                            )
+                            clip_scores.append(score)
+                        else:
+                            # Manual selection - save all candidates
+                            image.save(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
+
+                    # Select best candidate
+                    if qc_prompts:
+                        best_idx = int(np.argmax(clip_scores))
+                        print(f"      Selected candidate {best_idx} "
+                            f"(score: {clip_scores[best_idx]:.4f})")
+
+                        image = self._decode_latent(candidates[best_idx])
+                        image.save(f'{out_dir}/{frame_ix:03d}.png')
+
+                    else:
+                        # Manual selection
+                        print(f"      Saved {n_choices} candidates. Choose 0-{n_choices-1}:")
+                        choice = int(input("      Choice: "))
+                        best_idx = choice
+
+                        # Clean up non-selected candidates
+                        for i in range(n_choices):
+                            if i != choice:
+                                os.remove(f'{out_dir}/{frame_ix:03d}_{i}.png')
+                            else:
+                                os.rename(
+                                    f'{out_dir}/{frame_ix:03d}_{i}.png',
+                                    f'{out_dir}/{frame_ix:03d}.png'
+                                )
+
+                    # Cache the selected latent
+                    final_latents[frame_ix] = candidates[best_idx]
 
             # Reduce choices at finer levels
             n_choices = max(n_choices - 1, 3)

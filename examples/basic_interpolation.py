@@ -19,8 +19,9 @@ interpolator = DiffusersInterpolator(
 
 # Load images (replace with your own images)
 print("\nLoading images...")
-img1 = Image.open('../sample_imgs/noface1.png').convert('RGB').resize((512, 512))
-img2 = Image.open('../sample_imgs/noface2.png').convert('RGB').resize((512, 512))
+_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+img1 = Image.open(os.path.join(_repo, 'sample_imgs', 'noface1.png')).convert('RGB').resize((512, 512))
+img2 = Image.open(os.path.join(_repo, 'sample_imgs', 'noface2.jpeg')).convert('RGB').resize((512, 512))
 
 prompt = 'portrait, cartoon, mask, ghost, high resolution, highly detailed, ultra HD, 4k, simple, elegant'
 n_prompt = 'lowres, messy, lopsided, disfigured, low quality, photo'
