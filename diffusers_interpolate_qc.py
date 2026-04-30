@@ -477,8 +477,10 @@ class DiffusersInterpolator:
         self,
         img1: Image.Image,
         img2: Image.Image,
-        prompt: str,
-        n_prompt: str,
+        prompt1: str,
+        n_prompt1: str,
+        prompt2: str,
+        n_prompt2: str,
         num_iters: int = 200,
         lr: float = 1e-4,
         guide_scale: float = 7.5,
@@ -503,14 +505,18 @@ class DiffusersInterpolator:
             transforms.RandomResizedCrop(size=(512, 512), scale=(0.7, 1.0)),
         ])
 
-        # Get base embeddings
+        # Get base embeddings for each image
         with torch.no_grad():
-            cond_base = self._encode_prompt(prompt)
-            uncond_base = self._encode_prompt(n_prompt)
+            cond1_base = self._encode_prompt(prompt1)
+            cond2_base = self._encode_prompt(prompt2)
+            uncond1_base = self._encode_prompt(n_prompt1)
+            uncond2_base = self._encode_prompt(n_prompt2)
+            # Use average of negative prompts for shared uncond
+            uncond_base = (uncond1_base + uncond2_base) / 2
 
         # Create learnable copies in fp32 so Adam doesn't overflow on fp16
-        cond1 = cond_base.float().clone().detach().requires_grad_(True)
-        cond2 = cond_base.float().clone().detach().requires_grad_(True)
+        cond1 = cond1_base.float().clone().detach().requires_grad_(True)
+        cond2 = cond2_base.float().clone().detach().requires_grad_(True)
         uncond = uncond_base.float().clone().detach().requires_grad_(True)
 
         # Optimizer
@@ -662,8 +668,8 @@ class DiffusersInterpolator:
         self,
         img1: Image.Image,
         img2: Image.Image,
-        prompt: str = "a photograph",
-        n_prompt: str = "low quality, blurry",
+        prompt: Union[str, Tuple[str, str]] = "a photograph",
+        n_prompt: Union[str, Tuple[str, str]] = "low quality, blurry",
         qc_prompts: Optional[Tuple[str, str]] = None,
         num_frames: int = 17,
         n_choices: int = 8,
@@ -684,6 +690,17 @@ class DiffusersInterpolator:
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
+
+        # Handle prompt formats (single or per-image)
+        if isinstance(prompt, tuple):
+            prompt1, prompt2 = prompt
+        else:
+            prompt1 = prompt2 = prompt
+
+        if isinstance(n_prompt, tuple):
+            n_prompt1, n_prompt2 = n_prompt
+        else:
+            n_prompt1 = n_prompt2 = n_prompt
 
         # Setup output directory
         os.makedirs(out_dir, exist_ok=True)
@@ -728,20 +745,23 @@ class DiffusersInterpolator:
             h = hashlib.md5()
             h.update(np.array(img1).tobytes())
             h.update(np.array(img2).tobytes())
-            h.update(f"{prompt}|{n_prompt}|{optimize_cond}|{cond_lr}|{guide_scale}|{self.model_id}".encode())
+            h.update(f"{prompt1}|{n_prompt1}|{prompt2}|{n_prompt2}|{optimize_cond}|{cond_lr}|{guide_scale}|{self.model_id}".encode())
             cache_path = os.path.join(out_dir, f"embeddings_{h.hexdigest()}.pt")
 
             cond1, cond2, uncond = self._optimize_embeddings(
-                img1, img2, prompt, n_prompt,
+                img1, img2, prompt1, n_prompt1, prompt2, n_prompt2,
                 num_iters=optimize_cond, lr=cond_lr, guide_scale=guide_scale,
                 cache_path=cache_path,
             )
             print()
         else:
             print("Using base text embeddings (no optimization)...")
-            cond1 = self._encode_prompt(prompt)
-            cond2 = cond1.clone()
-            uncond = self._encode_prompt(n_prompt)
+            cond1 = self._encode_prompt(prompt1)
+            cond2 = self._encode_prompt(prompt2)
+            # Use average of negative prompts for shared uncond
+            uncond1 = self._encode_prompt(n_prompt1)
+            uncond2 = self._encode_prompt(n_prompt2)
+            uncond = (uncond1 + uncond2) / 2
             print()
 
         # Main inference (no gradients needed)
