@@ -47,20 +47,6 @@ class DiffusersInterpolator:
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        """
-        Initialize the interpolator with Stable Diffusion models.
-
-        Args:
-            model_id: HuggingFace model ID (SD 1.5 or 2.1)
-                     "runwayml/stable-diffusion-v1-5"
-                     "stabilityai/stable-diffusion-2-1"
-            controlnet_type: Optional ControlNet type
-                           None, "canny", "openpose", "depth", "seg"
-            device: Device to run on ("cuda", "mps", or "cpu")
-                   If None, auto-detects best available device
-            dtype: Data type (torch.float16 for CUDA, torch.float32 for MPS/CPU)
-                  If None, auto-selects based on device
-        """
         # Auto-detect device if not specified
         if device is None:
             if torch.cuda.is_available():
@@ -85,63 +71,34 @@ class DiffusersInterpolator:
 
         print(f"Loading Stable Diffusion from {model_id}...")
 
-        # Load VAE
-        print("  Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype).to(device)
         self.vae.eval()
 
-        # Load UNet
-        print("  Loading UNet...")
         self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet", torch_dtype=dtype).to(device)
         self.unet.eval()
 
-        # Load Text Encoder
-        print("  Loading Text Encoder...")
         self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
         self.text_encoder.eval()
 
-        # Load Tokenizer
         self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
-        # Load ControlNet if specified
         self.controlnet = None
-        if controlnet_type:
-            print(f"  Loading ControlNet ({controlnet_type})...")
-            controlnet_id = self._get_controlnet_id(controlnet_type, model_id)
-            self.controlnet = ControlNetModel.from_pretrained(
-                controlnet_id,
-                torch_dtype=dtype
-            ).to(device)
-            self.controlnet.eval()
+        # if controlnet_type:
+        #     print(f"  Loading ControlNet ({controlnet_type})...")
+        #     controlnet_id = self._get_controlnet_id(controlnet_type, model_id)
+        #     self.controlnet = ControlNetModel.from_pretrained(
+        #         controlnet_id,
+        #         torch_dtype=dtype
+        #     ).to(device)
+        #     self.controlnet.eval()
 
-        # Setup DDIM Scheduler
-        print("  Loading DDIM Scheduler...")
-        self.scheduler = DDIMScheduler.from_pretrained(
-            model_id,
-            subfolder="scheduler"
-        )
+        self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-        # Load CLIP for quality control
-        print("  Loading CLIP for quality control...")
-        self.clip_model = CLIPModel.from_pretrained(
-            "openai/clip-vit-large-patch14"
-        ).to(device)
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
         self.clip_model.eval()
 
-        self.clip_processor = CLIPProcessor.from_pretrained(
-            "openai/clip-vit-large-patch14"
-        )
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-        # Enable memory optimizations for MPS/CPU
-        if device in ["mps", "cpu"]:
-            print("  Enabling memory optimizations...")
-            self.unet.enable_attention_slicing(slice_size=1)
-            self.vae.enable_slicing()
-            self.vae.enable_tiling()
-
-        print("✓ All models loaded successfully!")
-
-        # Cache for VAE scaling factor
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
     def _get_controlnet_id(self, controlnet_type: str, base_model: str) -> str:
@@ -186,85 +143,38 @@ class DiffusersInterpolator:
 
     @torch.no_grad()
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
-        """
-        Encode text prompt to embeddings using CLIP.
+        text_inputs = self.tokenizer(prompt, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
 
-        Args:
-            prompt: Text prompt string
-
-        Returns:
-            text_embeddings: Tensor of shape (1, 77, 768) for SD1.5
-                                          or (1, 77, 1024) for SD2.1
-        """
-        # Tokenize
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        # Encode
-        text_embeddings = self.text_encoder(
-            text_inputs.input_ids.to(self.device)
-        )[0]
+        text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.device))[0]
 
         return text_embeddings
 
     @torch.no_grad()
     def _encode_image(self, image: Image.Image) -> torch.Tensor:
-        """
-        Encode PIL Image to latent representation.
-
-        Args:
-            image: PIL Image (RGB, should be 512x512)
-
-        Returns:
-            latent: Tensor of shape (1, 4, 64, 64)
-        """
-        # Convert PIL to tensor [0, 1]
         image_np = np.array(image).astype(np.float32) / 255.0
 
-        # Normalize to [-1, 1]
         image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
         image_tensor = (image_tensor - 0.5) * 2.0
         image_tensor = image_tensor.to(device=self.device, dtype=self.dtype)
 
-        # Encode to latent
         latent_dist = self.vae.encode(image_tensor).latent_dist
         latent = latent_dist.sample()
 
-        # Scale (important for proper reconstruction)
         latent = latent * self.vae.config.scaling_factor
 
         return latent
 
     @torch.no_grad()
     def _decode_latent(self, latent: torch.Tensor) -> Image.Image:
-        """
-        Decode latent to PIL Image.
-
-        Args:
-            latent: Tensor of shape (1, 4, 64, 64)
-
-        Returns:
-            image: PIL Image (RGB)
-        """
-        # Unscale
         latent = latent / self.vae.config.scaling_factor
 
-        # Decode
         image_tensor = self.vae.decode(latent).sample
 
-        # Convert from [-1, 1] to [0, 1]
         image_tensor = (image_tensor / 2 + 0.5).clamp(0, 1)
 
-        # Convert to numpy [0, 255]
         image_np = image_tensor.cpu().permute(0, 2, 3, 1).float().numpy()
         image_np = (image_np * 255).round().astype(np.uint8)
 
-        # Convert to PIL
         image = Image.fromarray(image_np[0])
 
         return image
@@ -276,50 +186,24 @@ class DiffusersInterpolator:
         timestep_schedule: List[int],
         share_noise: bool = True
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Build progressively noisier latents with shared noise schedule.
-
-        This is critical for hierarchical interpolation: we add noise incrementally
-        using the SAME noise realization for both images, ensuring interpolated
-        latents denoise properly.
-
-        Args:
-            img1, img2: Input images
-            timestep_schedule: List of timesteps [0, 250, 435, 625, ...]
-                              0 = clean, higher = more noise
-            share_noise: Use same noise for both images (True for temporal coherence)
-
-        Returns:
-            (latents1, latents2): Lists of noisy latents at each timestep level
-                                 latents1[0] = clean L1, latents1[-1] = max noise
-        """
-        # Encode clean images
         L1 = self._encode_image(img1)
         L2 = self._encode_image(img2)
 
         latents1 = [L1]
         latents2 = [L2]
 
-        # Progressively add noise
         for i in range(1, len(timestep_schedule)):
             t_prev = timestep_schedule[i - 1] if i > 0 else None
             t_now = timestep_schedule[i]
 
-            # Generate noise
             noise = torch.randn_like(L1)
 
-            # Add noise to first image
-            latents1.append(
-                self._add_noise(latents1[-1], noise, t_now, t_prev)
-            )
+            latents1.append(self._add_noise(latents1[-1], noise, t_now, t_prev))
 
-            # Add noise to second image (same noise if share_noise=True)
             if not share_noise:
                 noise = torch.randn_like(L2)
 
-            latents2.append(
-                self._add_noise(latents2[-1], noise, t_now, t_prev)
-            )
+            latents2.append(self._add_noise(latents2[-1], noise, t_now, t_prev))
 
         return latents1, latents2
 
@@ -330,21 +214,6 @@ class DiffusersInterpolator:
         t_now: int,
         t_prev: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Add noise to latent using DDIM forward process.
-
-        If t_prev is None: Add noise from scratch (x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε)
-        If t_prev is given: Add incremental noise from t_prev to t_now
-
-        Args:
-            latent: Current latent (clean or partially noised)
-            noise: Noise to add
-            t_now: Target timestep
-            t_prev: Previous timestep (None if starting from clean)
-
-        Returns:
-            Noisy latent at timestep t_now
-        """
         # Get alpha values from scheduler
         alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
 
@@ -385,21 +254,6 @@ class DiffusersInterpolator:
         guidance_scale: float = 7.5,
         controlnet_image: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Single DDIM denoising step.
-
-        Uses classifier-free guidance: noise_pred = uncond + scale * (cond - uncond)
-
-        Args:
-            latent: Current noisy latent (1, 4, 64, 64)
-            text_embeddings: Concatenated [uncond, cond] embeddings (2, 77, 768)
-            timestep: Current timestep (int, e.g., 500)
-            guidance_scale: CFG strength (typically 7.5)
-            controlnet_image: Optional ControlNet conditioning image
-
-        Returns:
-            Denoised latent (one step less noise)
-        """
         # Prepare timestep tensor
         t = torch.tensor([timestep], device=self.device, dtype=torch.long)
 
@@ -448,10 +302,6 @@ class DiffusersInterpolator:
             return_dict=False
         )[0]
 
-        # Clear MPS cache to prevent memory accumulation
-        if self.device == 'mps':
-            torch.mps.empty_cache()
-
         return latent
 
     def _optimize_embeddings(
@@ -465,23 +315,6 @@ class DiffusersInterpolator:
         guide_scale: float = 7.5,
         cache_path: Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Optimize text embeddings to reconstruct images (textual inversion).
-
-        Instead of using generic prompts, finds custom embeddings that help
-        the model reconstruct each specific image.
-
-        Args:
-            img1, img2: Input images
-            prompt: Base text prompt
-            n_prompt: Negative prompt
-            num_iters: Optimization iterations (200-500 recommended)
-            lr: Learning rate (1e-4 default)
-            guide_scale: CFG strength during optimization
-
-        Returns:
-            (cond1, cond2, uncond): Optimized embeddings for img1, img2, and negative
-        """
         if cache_path and os.path.exists(cache_path):
             print(f"Loading cached embeddings from {cache_path}")
             state = torch.load(cache_path, map_location=self.device)
@@ -612,18 +445,6 @@ class DiffusersInterpolator:
         pos_prompt: str,
         neg_prompt: str
     ) -> float:
-        """
-        Score image using CLIP similarity.
-
-        Args:
-            image: PIL Image to evaluate
-            pos_prompt: Positive text (e.g., "high quality, detailed")
-            neg_prompt: Negative text (e.g., "blurry, distorted")
-
-        Returns:
-            score: Float (higher is better)
-                  score = similarity(image, pos) - similarity(image, neg)
-        """
         # Process inputs
         inputs = self.clip_processor(
             text=[pos_prompt, neg_prompt],
@@ -673,30 +494,6 @@ class DiffusersInterpolator:
         out_dir: str = 'output',
         seed: Optional[int] = None
     ) -> List[Image.Image]:
-        """
-        Hierarchical bisection interpolation with CLIP-based quality control.
-
-        Args:
-            img1, img2: Input images (should be 512x512 RGB)
-            prompt: Text prompt for generation
-            n_prompt: Negative prompt
-            qc_prompts: (positive, negative) for CLIP scoring
-                       If None, uses manual selection
-            num_frames: Total frames (num_frames-1 must be power of 2)
-            n_choices: Candidates generated per frame
-            min_steps, max_steps: Noise range (0-1 or absolute indices)
-            ddim_steps: Total DDIM timesteps
-            guide_scale: Classifier-free guidance strength
-            optimize_cond: Textual inversion iterations (0 to disable)
-            cond_lr: Learning rate for textual inversion
-            latent_interp: 'slerp' or 'linear'
-            schedule_type: 'linear', 'convex', or 'concave'
-            out_dir: Output directory
-            seed: Random seed for reproducibility
-
-        Returns:
-            List of PIL Images (interpolation sequence)
-        """
         # Set random seed
         if seed is not None:
             torch.manual_seed(seed)
@@ -780,12 +577,14 @@ class DiffusersInterpolator:
 
             for level in range(1, num_levels + 1):
                 cur_step = step_schedule[-level]
+                prev_step = step_schedule[-level - 1] if level < num_levels else 0
                 t = int(timesteps[cur_step])
                 df = 2 ** (num_levels - level)  # Frame step at this level
 
                 print(f"Level {level}/{num_levels}:")
                 print(f"  Timestep: {t}")
                 print(f"  Frame step: {df}")
+                print(f"  Denoising range: timesteps[{prev_step}:{cur_step}]")
                 print(f"  Frames to generate: {len(range(df, num_frames-1, df*2))}")
 
                 for frame_ix in range(df, num_frames - 1, df * 2):
@@ -809,6 +608,8 @@ class DiffusersInterpolator:
                         sqrt_alpha = (alphas_cumprod[t] ** 0.5).item()
                         sqrt_one_minus = ((1 - alphas_cumprod[t]) ** 0.5).item()
 
+                        print(f" t {t} -> sqrt_alpha {sqrt_alpha:.4f}, sqrt_one_minus {sqrt_one_minus:.4f}")
+
                         # Noise the neighbors
                         l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
                         l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
@@ -816,10 +617,12 @@ class DiffusersInterpolator:
                         # Interpolate
                         noisy_latent = interp_fn(l1, l2, 0.5)
 
-                        # Denoise: timesteps is descending (high noise → low noise),
-                        # so iterate from cur_step UP to the end of the schedule.
+                        # Denoise: CRITICAL FIX - denoise from cur_step all the way to timestep 0
+                        # This matches cm.py:570-574 where ddim_sampler.sample(timesteps=cur_step)
+                        # denoises from cur_step to fully clean (timestep 0)
                         for step_idx in range(cur_step, len(timesteps)):
                             t_cur = int(timesteps[step_idx])
+                            print(f"      Denoising step {step_idx}/{len(timesteps)-1} (t={t_cur})...")
                             noisy_latent = self._denoise_step(
                                 noisy_latent, text_emb, t_cur, guide_scale
                             )
