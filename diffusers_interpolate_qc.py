@@ -17,6 +17,7 @@ import torch
 import numpy as np
 from PIL import Image
 from tqdm import trange
+import torch.nn.functional as F
 
 # HuggingFace Diffusers
 from diffusers import (
@@ -608,21 +609,25 @@ class DiffusersInterpolator:
                         sqrt_alpha = (alphas_cumprod[t] ** 0.5).item()
                         sqrt_one_minus = ((1 - alphas_cumprod[t]) ** 0.5).item()
 
-                        print(f" t {t} -> sqrt_alpha {sqrt_alpha:.4f}, sqrt_one_minus {sqrt_one_minus:.4f}")
+                        # print(f" t {t} -> sqrt_alpha {sqrt_alpha:.4f}, sqrt_one_minus {sqrt_one_minus:.4f}")
 
                         # Noise the neighbors
+                        # print(f"  Neighbor frames: {frame_ix - df} and {frame_ix + df}")
+                        # dis_parent = torch.nn.MSELoss()(final_latents[frame_ix - df], final_latents[frame_ix + df]).item()
+                        # print(f"  Parent distance (MSE): {dis_parent:.4f}")
                         l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
                         l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
 
                         # Interpolate
-                        noisy_latent = interp_fn(l1, l2, 0.5)
+                        # noisy_latent = interp_fn(l1, l2, 0.5)
+                        noisy_latent = l1 * 0.5 + l2 * 0.5
 
                         # Denoise: CRITICAL FIX - denoise from cur_step all the way to timestep 0
                         # This matches cm.py:570-574 where ddim_sampler.sample(timesteps=cur_step)
                         # denoises from cur_step to fully clean (timestep 0)
                         for step_idx in range(cur_step, len(timesteps)):
                             t_cur = int(timesteps[step_idx])
-                            print(f"      Denoising step {step_idx}/{len(timesteps)-1} (t={t_cur})...")
+                            # print(f"      Denoising step {step_idx}/{len(timesteps)-1} (t={t_cur})...")
                             noisy_latent = self._denoise_step(
                                 noisy_latent, text_emb, t_cur, guide_scale
                             )
