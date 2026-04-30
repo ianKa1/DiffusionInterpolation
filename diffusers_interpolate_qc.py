@@ -820,12 +820,16 @@ class DiffusersInterpolator:
                     if self.controlnet is not None and use_controlnet:
                         control_interp = self._interpolate_control_images(control1, control2, frac)
                         control_tensor = self._prepare_control_image(control_interp)
-                        # Optionally scale ControlNet strength based on frame position
-                        # Stronger at midpoint (frac=0.5), weaker at endpoints
-                        if controlnet_conditioning_scale is not None:
-                            control_scale = controlnet_conditioning_scale - 2 * abs(frac - 0.5) * (controlnet_conditioning_scale - 1.0)
-                        else:
+                        # Scale ControlNet strength:
+                        # - None or 1.0: uniform scale of 1.0
+                        # - <= 1.0: uniform scale at that value (use to globally reduce strength)
+                        # - > 1.0: dynamic — 1.0 at midpoint, controlnet_conditioning_scale at endpoints
+                        if controlnet_conditioning_scale is None:
                             control_scale = 1.0
+                        elif controlnet_conditioning_scale <= 1.0:
+                            control_scale = controlnet_conditioning_scale
+                        else:
+                            control_scale = 1.0 + 2 * abs(frac - 0.5) * (controlnet_conditioning_scale - 1.0)
 
                     # Generate N candidates
                     candidates = []
