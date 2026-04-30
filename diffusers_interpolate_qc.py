@@ -44,7 +44,7 @@ class DiffusersInterpolator:
     def __init__(
         self,
         model_id: str = "runwayml/stable-diffusion-v1-5",
-        controlnet_type: Optional[str] = None,
+        controlnet_model: Optional[str] = None,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -84,14 +84,31 @@ class DiffusersInterpolator:
         self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
 
         self.controlnet = None
-        # if controlnet_type:
-        #     print(f"  Loading ControlNet ({controlnet_type})...")
-        #     controlnet_id = self._get_controlnet_id(controlnet_type, model_id)
-        #     self.controlnet = ControlNetModel.from_pretrained(
-        #         controlnet_id,
-        #         torch_dtype=dtype
-        #     ).to(device)
-        #     self.controlnet.eval()
+        self.controlnet_processor = None
+        if controlnet_model:
+            print(f"  Loading ControlNet from {controlnet_model}...")
+            self.controlnet = ControlNetModel.from_pretrained(
+                controlnet_model,
+                torch_dtype=dtype
+            ).to(device)
+            self.controlnet.eval()
+
+            # Load controlnet_aux processor based on model type
+            if 'openpose' in controlnet_model.lower():
+                from controlnet_aux import OpenposeDetector
+                self.controlnet_processor = OpenposeDetector.from_pretrained('lllyasviel/ControlNet')
+                self.controlnet_type = 'openpose'
+            elif 'canny' in controlnet_model.lower():
+                from controlnet_aux import CannyDetector
+                self.controlnet_processor = CannyDetector()
+                self.controlnet_type = 'canny'
+            elif 'depth' in controlnet_model.lower():
+                from controlnet_aux import MidasDetector
+                self.controlnet_processor = MidasDetector.from_pretrained('lllyasviel/ControlNet')
+                self.controlnet_type = 'depth'
+            else:
+                print(f"  Warning: Unknown controlnet type, processor not loaded")
+                self.controlnet_type = None
 
         self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
@@ -101,6 +118,155 @@ class DiffusersInterpolator:
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+
+    def _prepare_control_image(self, image: Image.Image) -> torch.Tensor:
+        """
+        Prepare control image for ControlNet.
+
+        Args:
+            image: PIL Image (control signal, e.g., pose skeleton, canny edges)
+
+        Returns:
+            Control tensor ready for ControlNet [B, C, H, W]
+        """
+        # Convert to numpy and normalize
+        image_np = np.array(image).astype(np.float32) / 255.0
+
+        # Convert to tensor [C, H, W]
+        control_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
+        control_tensor = control_tensor.to(device=self.device, dtype=self.dtype)
+
+        return control_tensor
+
+    def _stylize_to_photo(
+        self,
+        image: Image.Image,
+        prompt: str = "a photograph of a person",
+        n_prompt: str = "cartoon, illustration, painting, drawing",
+        num_steps: int = 20,
+        guidance_scale: float = 7.5,
+        strength: float = 0.6
+    ) -> Image.Image:
+        """
+        Convert stylized image to photographic style for better pose detection.
+
+        This is the trick from the paper: when input is stylized (cartoon, etc),
+        OpenPose fails. So we first translate to photo style using LDM.
+
+        Args:
+            image: Stylized input image
+            prompt: Prompt for photographic style
+            n_prompt: Negative prompt (what to avoid)
+            num_steps: Number of diffusion steps
+            guidance_scale: CFG scale
+            strength: How much to modify (0=no change, 1=full denoise)
+
+        Returns:
+            Photo-styled version of input image
+        """
+        print("  Converting stylized image to photo for pose detection...")
+
+        # Encode image to latent
+        latent = self._encode_image(image)
+
+        # Setup scheduler for image-to-image
+        self.scheduler.set_timesteps(num_steps)
+        timesteps = self.scheduler.timesteps
+
+        # Add noise according to strength
+        # strength=0.6 means start from 60% noise (skip 40% of denoising)
+        init_timestep_idx = int(num_steps * strength)
+        init_timestep = timesteps[init_timestep_idx]
+
+        noise = torch.randn_like(latent)
+        latent = self.scheduler.add_noise(latent, noise, init_timestep)
+
+        # Get text embeddings
+        cond = self._encode_prompt(prompt)
+        uncond = self._encode_prompt(n_prompt)
+        text_emb = torch.cat([uncond, cond])
+
+        # Denoise from init_timestep to clean
+        with torch.no_grad():
+            for t in timesteps[init_timestep_idx:]:
+                latent = self._denoise_step(
+                    latent, text_emb, int(t), guidance_scale
+                )
+
+        # Decode to image
+        result = self._decode_latent(latent)
+
+        return result
+
+    def _extract_control_signal(self, image: Image.Image) -> Image.Image:
+        """
+        Extract control signal from input image using controlnet_aux processor.
+
+        Args:
+            image: Input PIL Image
+
+        Returns:
+            Control signal as PIL Image (e.g., pose skeleton, edges)
+        """
+        if self.controlnet_processor is None:
+            raise ValueError("ControlNet processor not initialized")
+
+        if self.controlnet_type == 'openpose':
+            # First attempt: try to detect pose directly
+            control_image = self.controlnet_processor(image, hand_and_face=False)
+
+            # Check if pose was detected
+            control_array = np.array(control_image)
+            if control_array.max() == 0:
+                print(f"  No pose detected! Trying photo-style translation trick...")
+                # Trick from paper: translate stylized image to photo first
+                photo_image = self._stylize_to_photo(image)
+
+                # Try pose detection again on photo-styled version
+                control_image = self.controlnet_processor(photo_image, hand_and_face=False)
+
+                control_array = np.array(control_image)
+                if control_array.max() == 0:
+                    print(f"  Warning: Still no pose detected after photo translation! Using edges as fallback.")
+                    # Last resort: use canny edges
+                    from controlnet_aux import CannyDetector
+                    canny_detector = CannyDetector()
+                    control_image = canny_detector(image, low_threshold=100, high_threshold=200)
+                else:
+                    print(f"  Success! Pose detected after photo translation (max: {control_array.max()})")
+            else:
+                print(f"  Pose detected directly (max pixel value: {control_array.max()})")
+
+        elif self.controlnet_type == 'canny':
+            # Returns PIL image of canny edges
+            control_image = self.controlnet_processor(image, low_threshold=100, high_threshold=200)
+        elif self.controlnet_type == 'depth':
+            # Returns PIL image of depth map
+            control_image = self.controlnet_processor(image)
+        else:
+            raise ValueError(f"Unknown controlnet type: {self.controlnet_type}")
+
+        return control_image
+
+    def _interpolate_control_images(
+        self,
+        control1: Image.Image,
+        control2: Image.Image,
+        alpha: float
+    ) -> Image.Image:
+        """
+        Interpolate between two control images.
+
+        Args:
+            control1: First control image (PIL)
+            control2: Second control image (PIL)
+            alpha: Interpolation factor [0, 1]
+
+        Returns:
+            Interpolated control image (PIL)
+        """
+        # Simple cross-fade interpolation
+        return Image.blend(control1, control2, alpha)
 
     def _get_controlnet_id(self, controlnet_type: str, base_model: str) -> str:
         """
@@ -492,6 +658,8 @@ class DiffusersInterpolator:
         cond_lr: float = 1e-4,
         latent_interp: str = 'slerp',
         schedule_type: str = 'linear',
+        use_controlnet: bool = False,
+        controlnet_conditioning_scale: Optional[float] = None,
         out_dir: str = 'output',
         seed: Optional[int] = None
     ) -> List[Image.Image]:
@@ -561,6 +729,18 @@ class DiffusersInterpolator:
 
         # Main inference (no gradients needed)
         with torch.no_grad():
+            # Extract control signals if using ControlNet
+            control1 = None
+            control2 = None
+            if self.controlnet is not None and use_controlnet:
+                print("Extracting control signals from endpoint images...")
+                control1 = self._extract_control_signal(img1)
+                control2 = self._extract_control_signal(img2)
+                # Save for inspection
+                control1.save(f'{out_dir}/control_000.png')
+                control2.save(f'{out_dir}/control_{num_frames-1:03d}.png')
+                print(f"Saved control signals to {out_dir}/\n")
+
             # Encode endpoint images
             print("Encoding endpoint images...")
             final_latents = [None] * num_frames
@@ -597,6 +777,18 @@ class DiffusersInterpolator:
                     cond_interp = interp_fn(cond1, cond2, frac)
                     text_emb = torch.cat([uncond, cond_interp])
 
+                    # Interpolate control signal if using ControlNet
+                    control_tensor = None
+                    if self.controlnet is not None and use_controlnet:
+                        control_interp = self._interpolate_control_images(control1, control2, frac)
+                        control_tensor = self._prepare_control_image(control_interp)
+                        # Optionally scale ControlNet strength based on frame position
+                        # Stronger at midpoint (frac=0.5), weaker at endpoints
+                        if controlnet_conditioning_scale is not None:
+                            control_scale = controlnet_conditioning_scale - 2 * abs(frac - 0.5) * (controlnet_conditioning_scale - 1.0)
+                        else:
+                            control_scale = 1.0
+
                     # Generate N candidates
                     candidates = []
                     clip_scores = []
@@ -618,18 +810,20 @@ class DiffusersInterpolator:
                         l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
                         l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
 
-                        # Interpolate
-                        # noisy_latent = interp_fn(l1, l2, 0.5)
+                        # Interpolate - use simple averaging (NOT slerp for noisy latents!)
                         noisy_latent = l1 * 0.5 + l2 * 0.5
 
-                        # Denoise: CRITICAL FIX - denoise from cur_step all the way to timestep 0
-                        # This matches cm.py:570-574 where ddim_sampler.sample(timesteps=cur_step)
-                        # denoises from cur_step to fully clean (timestep 0)
+                        # Denoise: denoise from cur_step all the way to timestep 0
                         for step_idx in range(cur_step, len(timesteps)):
                             t_cur = int(timesteps[step_idx])
-                            # print(f"      Denoising step {step_idx}/{len(timesteps)-1} (t={t_cur})...")
+                            # Scale control tensor if using dynamic strength
+                            control_input = control_tensor
+                            if control_tensor is not None and controlnet_conditioning_scale is not None:
+                                control_input = control_tensor * control_scale
+
                             noisy_latent = self._denoise_step(
-                                noisy_latent, text_emb, t_cur, guide_scale
+                                noisy_latent, text_emb, t_cur, guide_scale,
+                                controlnet_image=control_input
                             )
 
                         candidates.append(noisy_latent)
