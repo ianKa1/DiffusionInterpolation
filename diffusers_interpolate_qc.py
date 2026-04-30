@@ -518,6 +518,12 @@ class DiffusersInterpolator:
         self.scheduler.set_timesteps(50)  # Dummy schedule to get timesteps
         timesteps = self.scheduler.timesteps.cpu().numpy()
 
+        # Track best embeddings (for unstable loss)
+        best_loss = float('inf')
+        best_cond1 = None
+        best_cond2 = None
+        best_uncond = None
+
         # Training loop
         for iteration in range(num_iters):
             # Random timestep from middle range (not too easy, not too hard)
@@ -592,14 +598,23 @@ class DiffusersInterpolator:
             optimizer.step()
             optimizer.zero_grad()
 
+            # Save best embeddings (for unstable loss)
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_cond1 = cond1.detach().clone()
+                best_cond2 = cond2.detach().clone()
+                best_uncond = uncond.detach().clone()
+
             # Log progress
             if iteration % 10 == 0:
                 print(f"  Iter {iteration}/{num_iters}: "
-                      f"loss1={loss1.item():.4f}, loss2={loss2.item():.4f}")
+                      f"loss1={loss1.item():.4f}, loss2={loss2.item():.4f}, "
+                      f"total={total_loss.item():.4f}, best={best_loss:.4f}")
 
-        print(f"✓ Optimization complete!")
+        print(f"✓ Optimization complete! Best loss: {best_loss:.4f}")
 
-        result = (cond1.detach().to(self.dtype), cond2.detach().to(self.dtype), uncond.detach().to(self.dtype))
+        # Use best embeddings (not final ones, since loss can be unstable)
+        result = (best_cond1.to(self.dtype), best_cond2.to(self.dtype), best_uncond.to(self.dtype))
         if cache_path:
             torch.save({'cond1': result[0], 'cond2': result[1], 'uncond': result[2]}, cache_path)
             print(f"Saved embeddings to {cache_path}")
