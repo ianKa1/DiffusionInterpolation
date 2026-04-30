@@ -419,7 +419,8 @@ class DiffusersInterpolator:
         text_embeddings: torch.Tensor,
         timestep: int,
         guidance_scale: float = 7.5,
-        controlnet_image: Optional[torch.Tensor] = None
+        controlnet_image: Optional[torch.Tensor] = None,
+        controlnet_conditioning_scale: float = 1.0
     ) -> torch.Tensor:
         # Prepare timestep tensor
         t = torch.tensor([timestep], device=self.device, dtype=torch.long)
@@ -443,6 +444,7 @@ class DiffusersInterpolator:
                 t,
                 encoder_hidden_states=text_embeddings,
                 controlnet_cond=controlnet_cond,
+                conditioning_scale=controlnet_conditioning_scale,
                 return_dict=False,
             )
 
@@ -794,6 +796,7 @@ class DiffusersInterpolator:
 
                     # Interpolate control signal if using ControlNet
                     control_tensor = None
+                    control_scale = 1.0  # Default scale
                     if self.controlnet is not None and use_controlnet:
                         control_interp = self._interpolate_control_images(control1, control2, frac)
                         control_tensor = self._prepare_control_image(control_interp)
@@ -831,14 +834,11 @@ class DiffusersInterpolator:
                         # Denoise: denoise from cur_step all the way to timestep 0
                         for step_idx in range(cur_step, len(timesteps)):
                             t_cur = int(timesteps[step_idx])
-                            # Scale control tensor if using dynamic strength
-                            control_input = control_tensor
-                            if control_tensor is not None and controlnet_conditioning_scale is not None:
-                                control_input = control_tensor * control_scale
 
                             noisy_latent = self._denoise_step(
                                 noisy_latent, text_emb, t_cur, guide_scale,
-                                controlnet_image=control_input
+                                controlnet_image=control_tensor,
+                                controlnet_conditioning_scale=control_scale
                             )
 
                         candidates.append(noisy_latent)
