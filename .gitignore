@@ -1,0 +1,30 @@
+# Example output directories
+examples/*/output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+.claude
+
+# PyTorch
+*.pt
+*.pth
+
+*.pdf
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
