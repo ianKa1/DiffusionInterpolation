@@ -1,13 +1,3 @@
-"""
-Standalone implementation of interpolate_qc using HuggingFace Diffusers.
-
-Hierarchical bisection interpolation with CLIP-based quality control.
-No dependencies on custom ControlNet implementation.
-
-Author: Refactored from original cm.py
-Date: 2024
-"""
-
 import os
 import hashlib
 import shutil
@@ -120,19 +110,8 @@ class DiffusersInterpolator:
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
     def _prepare_control_image(self, image: Image.Image) -> torch.Tensor:
-        """
-        Prepare control image for ControlNet.
-
-        Args:
-            image: PIL Image (control signal, e.g., pose skeleton, canny edges)
-
-        Returns:
-            Control tensor ready for ControlNet [B, C, H, W]
-        """
-        # Convert to numpy and normalize
         image_np = np.array(image).astype(np.float32) / 255.0
 
-        # Convert to tensor [C, H, W]
         control_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
         control_tensor = control_tensor.to(device=self.device, dtype=self.dtype)
 
@@ -149,44 +128,22 @@ class DiffusersInterpolator:
     ) -> Image.Image:
         """
         Convert stylized image to photographic style for better pose detection.
-
-        This is the trick from the paper: when input is stylized (cartoon, etc),
-        OpenPose fails. So we first translate to photo style using LDM.
-
-        Args:
-            image: Stylized input image
-            prompt: Prompt for photographic style
-            n_prompt: Negative prompt (what to avoid)
-            num_steps: Number of diffusion steps
-            guidance_scale: CFG scale
-            strength: How much to modify (0=no change, 1=full denoise)
-
-        Returns:
-            Photo-styled version of input image
         """
-        print("  Converting stylized image to photo for pose detection...")
-
-        # Encode image to latent
         latent = self._encode_image(image)
 
-        # Setup scheduler for image-to-image
         self.scheduler.set_timesteps(num_steps)
         timesteps = self.scheduler.timesteps
 
-        # Add noise according to strength
-        # strength=0.6 means start from 60% noise (skip 40% of denoising)
         init_timestep_idx = int(num_steps * strength)
         init_timestep = timesteps[init_timestep_idx]
 
         noise = torch.randn_like(latent)
         latent = self.scheduler.add_noise(latent, noise, init_timestep)
 
-        # Get text embeddings
         cond = self._encode_prompt(prompt)
         uncond = self._encode_prompt(n_prompt)
         text_emb = torch.cat([uncond, cond])
 
-        # Denoise from init_timestep to clean
         with torch.no_grad():
             for t in timesteps[init_timestep_idx:]:
                 latent = self._denoise_step(
@@ -199,15 +156,6 @@ class DiffusersInterpolator:
         return result
 
     def _extract_control_signal(self, image: Image.Image) -> Image.Image:
-        """
-        Extract control signal from input image using controlnet_aux processor.
-
-        Args:
-            image: Input PIL Image
-
-        Returns:
-            Control signal as PIL Image (e.g., pose skeleton, edges)
-        """
         if self.controlnet_processor is None:
             raise ValueError("ControlNet processor not initialized")
 
@@ -254,30 +202,11 @@ class DiffusersInterpolator:
         control2: Image.Image,
         alpha: float
     ) -> Image.Image:
-        """
-        Interpolate between two control images.
-
-        Args:
-            control1: First control image (PIL)
-            control2: Second control image (PIL)
-            alpha: Interpolation factor [0, 1]
-
-        Returns:
-            Interpolated control image (PIL)
-        """
-        # Simple cross-fade interpolation
         return Image.blend(control1, control2, alpha)
 
     def _get_controlnet_id(self, controlnet_type: str, base_model: str) -> str:
         """
         Get HuggingFace ControlNet model ID based on type and base model.
-
-        Args:
-            controlnet_type: "canny", "openpose", "depth", "seg", etc.
-            base_model: Base SD model ID
-
-        Returns:
-            ControlNet model ID
         """
         # Map controlnet types to HuggingFace model IDs
         if "stable-diffusion-v1-5" in base_model or "v1-5" in base_model:
@@ -289,13 +218,6 @@ class DiffusersInterpolator:
                 "mlsd": "lllyasviel/sd-controlnet-mlsd",
                 "normal": "lllyasviel/sd-controlnet-normal",
                 "scribble": "lllyasviel/sd-controlnet-scribble",
-            }
-        elif "stable-diffusion-2" in base_model:
-            # SD 2.x ControlNets (fewer available)
-            controlnet_map = {
-                "canny": "thibaud/controlnet-sd21-canny-diffusers",
-                "depth": "thibaud/controlnet-sd21-depth-diffusers",
-                "openpose": "thibaud/controlnet-sd21-openpose-diffusers",
             }
         else:
             raise ValueError(f"Unknown base model: {base_model}")
@@ -381,31 +303,22 @@ class DiffusersInterpolator:
         t_now: int,
         t_prev: Optional[int] = None
     ) -> torch.Tensor:
-        # Get alpha values from scheduler
         alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
 
         if t_prev is None:
-            # Add noise from scratch: x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
             sqrt_alpha = alphas_cumprod[t_now] ** 0.5
             sqrt_one_minus_alpha = (1 - alphas_cumprod[t_now]) ** 0.5
 
             noisy_latent = sqrt_alpha * latent + sqrt_one_minus_alpha * noise
 
         else:
-            # Add incremental noise from t_prev to t_now
-            # Given: x_{t_prev} = √ᾱ_{t_prev} * x_0 + √(1-ᾱ_{t_prev}) * ε_{prev}
-            # Want:  x_{t_now} = √ᾱ_{t_now} * x_0 + √(1-ᾱ_{t_now}) * ε_{combined}
-            # Where ε_{combined} includes ε_{prev} plus new noise
-
             a_prev = alphas_cumprod[t_prev] ** 0.5
             a_now = alphas_cumprod[t_now] ** 0.5
             sig_prev = (1 - alphas_cumprod[t_prev]) ** 0.5
             sig_now = (1 - alphas_cumprod[t_now]) ** 0.5
 
-            # Scale factor for existing latent
             scale = a_now / a_prev
 
-            # Additional noise needed
             sigma = (sig_now**2 - (scale * sig_prev)**2) ** 0.5
 
             noisy_latent = scale * latent + sigma * noise
@@ -422,21 +335,16 @@ class DiffusersInterpolator:
         controlnet_image: Optional[torch.Tensor] = None,
         controlnet_conditioning_scale: float = 1.0
     ) -> torch.Tensor:
-        # Prepare timestep tensor
         t = torch.tensor([timestep], device=self.device, dtype=torch.long)
 
-        # Duplicate latent for CFG (uncond + cond)
         latent_model_input = torch.cat([latent, latent])
 
-        # Scale latent for UNet (some schedulers require this)
         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-        # ControlNet forward pass (if enabled)
         down_block_res_samples = None
         mid_block_res_sample = None
 
         if self.controlnet is not None and controlnet_image is not None:
-            # Duplicate control image for CFG
             controlnet_cond = torch.cat([controlnet_image, controlnet_image])
 
             down_block_res_samples, mid_block_res_sample = self.controlnet(
@@ -448,7 +356,6 @@ class DiffusersInterpolator:
                 return_dict=False,
             )
 
-        # UNet forward pass
         noise_pred = self.unet(
             latent_model_input,
             t,
@@ -457,19 +364,10 @@ class DiffusersInterpolator:
             mid_block_additional_residual=mid_block_res_sample,
         ).sample
 
-        # Perform classifier-free guidance
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (
-            noise_pred_cond - noise_pred_uncond
-        )
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        # Scheduler step (denoise one step)
-        latent = self.scheduler.step(
-            noise_pred,
-            timestep,
-            latent,
-            return_dict=False
-        )[0]
+        latent = self.scheduler.step(noise_pred, timestep, latent, return_dict=False)[0]
 
         return latent
 
@@ -495,8 +393,6 @@ class DiffusersInterpolator:
                 state['uncond'].to(self.dtype),
             )
 
-        print(f"Optimizing text embeddings ({num_iters} iterations)...")
-
         # Data augmentation (prevents overfitting)
         augment = transforms.Compose([
             transforms.ColorJitter(
@@ -505,76 +401,58 @@ class DiffusersInterpolator:
             transforms.RandomResizedCrop(size=(512, 512), scale=(0.7, 1.0)),
         ])
 
-        # Get base embeddings for each image
         with torch.no_grad():
             cond1_base = self._encode_prompt(prompt1)
             cond2_base = self._encode_prompt(prompt2)
             uncond1_base = self._encode_prompt(n_prompt1)
             uncond2_base = self._encode_prompt(n_prompt2)
-            # Use average of negative prompts for shared uncond
             uncond_base = (uncond1_base + uncond2_base) / 2
 
-        # Create learnable copies in fp32 so Adam doesn't overflow on fp16
         cond1 = cond1_base.float().clone().detach().requires_grad_(True)
         cond2 = cond2_base.float().clone().detach().requires_grad_(True)
         uncond = uncond_base.float().clone().detach().requires_grad_(True)
 
-        # Optimizer
         optimizer = torch.optim.Adam([cond1, cond2, uncond], lr=lr)
 
-        # Setup scheduler for optimization
-        self.scheduler.set_timesteps(50)  # Dummy schedule to get timesteps
+        self.scheduler.set_timesteps(50)
         timesteps = self.scheduler.timesteps.cpu().numpy()
 
-        # Track best embeddings (for unstable loss)
         best_loss = float('inf')
         best_cond1 = None
         best_cond2 = None
         best_uncond = None
 
-        # Training loop
         for iteration in range(num_iters):
-            # Random timestep from middle range (not too easy, not too hard)
             t_idx = np.random.randint(len(timesteps) // 3, 2 * len(timesteps) // 3)
             t = int(timesteps[t_idx])
 
-            # === Optimize embedding for img1 ===
-
-            # Apply augmentation
             img1_aug = augment(img1)
 
-            # Encode augmented image
             with torch.no_grad():
                 L1 = self._encode_image(img1_aug)
 
-            # Add noise at random timestep
             noise = torch.randn_like(L1)
             alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
             sqrt_alpha = alphas_cumprod[t] ** 0.5
             sqrt_one_minus_alpha = (1 - alphas_cumprod[t]) ** 0.5
             noisy_L1 = sqrt_alpha * L1 + sqrt_one_minus_alpha * noise
 
-            # Predict noise using current cond1 (cast to model dtype for UNet)
             text_emb = torch.cat([uncond, cond1]).to(self.dtype)
             latent_input = torch.cat([noisy_L1, noisy_L1])
             t_tensor = torch.tensor([t] * 2, device=self.device, dtype=torch.long)
 
-            # UNet forward pass
             noise_pred = self.unet(
                 latent_input,
                 t_tensor,
                 encoder_hidden_states=text_emb,
             ).sample
 
-            # Apply CFG and compute loss in fp32 to avoid overflow
             noise_pred_uncond, noise_pred_cond = noise_pred.float().chunk(2)
             noise_pred_guided = noise_pred_uncond + guide_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
 
             loss1 = torch.nn.functional.mse_loss(noise_pred_guided, noise.float())
-
-            # === Optimize embedding for img2 ===
 
             img2_aug = augment(img2)
 
@@ -587,12 +465,8 @@ class DiffusersInterpolator:
             text_emb = torch.cat([uncond, cond2]).to(self.dtype)
             latent_input = torch.cat([noisy_L2, noisy_L2])
 
-            noise_pred = self.unet(
-                latent_input,
-                t_tensor,
-                encoder_hidden_states=text_emb,
-            ).sample
-
+            noise_pred = self.unet(latent_input, t_tensor, encoder_hidden_states=text_emb,).sample
+            
             noise_pred_uncond, noise_pred_cond = noise_pred.float().chunk(2)
             noise_pred_guided = noise_pred_uncond + guide_scale * (
                 noise_pred_cond - noise_pred_uncond
@@ -600,20 +474,17 @@ class DiffusersInterpolator:
 
             loss2 = torch.nn.functional.mse_loss(noise_pred_guided, noise.float())
 
-            # Backprop and update
             total_loss = loss1 + loss2
             total_loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
-            # Save best embeddings (for unstable loss)
             if total_loss.item() < best_loss:
                 best_loss = total_loss.item()
                 best_cond1 = cond1.detach().clone()
                 best_cond2 = cond2.detach().clone()
                 best_uncond = uncond.detach().clone()
 
-            # Log progress
             if iteration % 10 == 0:
                 print(f"  Iter {iteration}/{num_iters}: "
                       f"loss1={loss1.item():.4f}, loss2={loss2.item():.4f}, "
@@ -635,23 +506,14 @@ class DiffusersInterpolator:
         pos_prompt: str,
         neg_prompt: str
     ) -> float:
-        # Process inputs
-        inputs = self.clip_processor(
-            text=[pos_prompt, neg_prompt],
-            images=image,
-            return_tensors="pt",
-            padding=True
-        )
+        inputs = self.clip_processor(text=[pos_prompt, neg_prompt], images=image, return_tensors="pt", padding=True)
 
-        # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Get embeddings
         outputs = self.clip_model(**inputs)
         image_embeds = outputs.image_embeds
         text_embeds = outputs.text_embeds
 
-        # Compute similarities
         pos_sim = torch.nn.functional.cosine_similarity(
             image_embeds, text_embeds[0:1]
         )
@@ -659,7 +521,6 @@ class DiffusersInterpolator:
             image_embeds, text_embeds[1:2]
         )
 
-        # Score = positive similarity - negative similarity
         score = (pos_sim - neg_sim).item()
 
         return score
@@ -686,12 +547,10 @@ class DiffusersInterpolator:
         out_dir: str = 'output',
         seed: Optional[int] = None
     ) -> List[Image.Image]:
-        # Set random seed
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-        # Handle prompt formats (single or per-image)
         if isinstance(prompt, tuple):
             prompt1, prompt2 = prompt
         else:
@@ -702,7 +561,6 @@ class DiffusersInterpolator:
         else:
             n_prompt1 = n_prompt2 = n_prompt
 
-        # Setup output directory
         os.makedirs(out_dir, exist_ok=True)
         img1.save(f'{out_dir}/000.png')
         img2.save(f'{out_dir}/{num_frames-1:03d}.png')
@@ -797,7 +655,7 @@ class DiffusersInterpolator:
                 cur_step = step_schedule[-level]
                 prev_step = step_schedule[-level - 1] if level < num_levels else 0
                 t = int(timesteps[cur_step])
-                df = 2 ** (num_levels - level)  # Frame step at this level
+                df = 2 ** (num_levels - level)
 
                 print(f"Level {level}/{num_levels}:")
                 print(f"  Timestep: {t}")
@@ -810,20 +668,15 @@ class DiffusersInterpolator:
 
                     print(f"    Generating frame {frame_ix}/{num_frames-1} (α={frac:.3f})...")
 
-                    # Interpolate text conditioning
                     cond_interp = interp_fn(cond1, cond2, frac)
                     text_emb = torch.cat([uncond, cond_interp])
 
-                    # Interpolate control signal if using ControlNet
                     control_tensor = None
                     control_scale = 1.0  # Default scale
                     if self.controlnet is not None and use_controlnet:
                         control_interp = self._interpolate_control_images(control1, control2, frac)
                         control_tensor = self._prepare_control_image(control_interp)
-                        # Scale ControlNet strength:
-                        # - None or 1.0: uniform scale of 1.0
-                        # - <= 1.0: uniform scale at that value (use to globally reduce strength)
-                        # - > 1.0: dynamic — 1.0 at midpoint, controlnet_conditioning_scale at endpoints
+                        
                         if controlnet_conditioning_scale is None:
                             control_scale = 1.0
                         elif controlnet_conditioning_scale <= 1.0:
@@ -831,31 +684,22 @@ class DiffusersInterpolator:
                         else:
                             control_scale = 1.0 + 2 * abs(frac - 0.5) * (controlnet_conditioning_scale - 1.0)
 
-                    # Generate N candidates
                     candidates = []
                     clip_scores = []
 
                     for choice_ix in range(n_choices):
-                        # Add noise to neighboring final_latents
                         noise = torch.randn_like(final_latents[0])
 
                         alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
                         sqrt_alpha = (alphas_cumprod[t] ** 0.5).item()
                         sqrt_one_minus = ((1 - alphas_cumprod[t]) ** 0.5).item()
 
-                        # print(f" t {t} -> sqrt_alpha {sqrt_alpha:.4f}, sqrt_one_minus {sqrt_one_minus:.4f}")
-
-                        # Noise the neighbors
-                        # print(f"  Neighbor frames: {frame_ix - df} and {frame_ix + df}")
-                        # dis_parent = torch.nn.MSELoss()(final_latents[frame_ix - df], final_latents[frame_ix + df]).item()
-                        # print(f"  Parent distance (MSE): {dis_parent:.4f}")
                         l1 = sqrt_alpha * final_latents[frame_ix - df] + sqrt_one_minus * noise
                         l2 = sqrt_alpha * final_latents[frame_ix + df] + sqrt_one_minus * noise
 
-                        # Interpolate - use simple averaging (NOT slerp for noisy latents!)
+                        # use linear interpolation
                         noisy_latent = l1 * 0.5 + l2 * 0.5
 
-                        # Denoise: denoise from cur_step all the way to timestep 0
                         for step_idx in range(cur_step, len(timesteps)):
                             t_cur = int(timesteps[step_idx])
 
@@ -867,20 +711,16 @@ class DiffusersInterpolator:
 
                         candidates.append(noisy_latent)
 
-                        # Decode and evaluate
                         image = self._decode_latent(noisy_latent)
 
                         if qc_prompts:
                             # Automatic CLIP scoring
-                            score = self._evaluate_with_clip(
-                                image, qc_prompts[0], qc_prompts[1]
-                            )
+                            score = self._evaluate_with_clip(image, qc_prompts[0], qc_prompts[1])
                             clip_scores.append(score)
                         else:
                             # Manual selection - save all candidates
                             image.save(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
 
-                    # Select best candidate
                     if qc_prompts:
                         best_idx = int(np.argmax(clip_scores))
                         print(f"      Selected candidate {best_idx} "
@@ -895,7 +735,6 @@ class DiffusersInterpolator:
                         choice = int(input("      Choice: "))
                         best_idx = choice
 
-                        # Clean up non-selected candidates
                         for i in range(n_choices):
                             if i != choice:
                                 os.remove(f'{out_dir}/{frame_ix:03d}_{i}.png')
@@ -905,15 +744,12 @@ class DiffusersInterpolator:
                                     f'{out_dir}/{frame_ix:03d}.png'
                                 )
 
-                    # Cache the selected latent
                     final_latents[frame_ix] = candidates[best_idx]
 
-            # Reduce choices at finer levels
             n_choices = max(n_choices - 1, 3)
 
             print()
 
-        # Decode all final frames
         print(f"{'='*70}")
         print("Decoding Final Sequence")
         print(f"{'='*70}\n")
@@ -938,33 +774,12 @@ class DiffusersInterpolator:
 
         return result_images
 
-
-# ============================================================================
-# Helper Functions (copied from cm.py)
-# ============================================================================
-
 def get_step_schedule(
     min_steps: int,
     max_steps: int,
     num_levels: int,
     schedule_type: str = 'linear'
 ) -> List[int]:
-    """
-    Generate step schedule for hierarchical interpolation.
-
-    Args:
-        min_steps: Starting step index
-        max_steps: Ending step index
-        num_levels: Number of hierarchy levels
-        schedule_type: 'linear', 'convex', or 'concave'
-
-    Returns:
-        List of step indices [0, step1, step2, ..., stepN]
-
-    Example:
-        >>> get_step_schedule(50, 125, 3, 'linear')
-        [0, 50, 87, 125]
-    """
     diff = max_steps - min_steps
 
     if schedule_type == 'concave':
@@ -987,21 +802,6 @@ def get_step_schedule(
 
 @torch.no_grad()
 def slerp(p0: torch.Tensor, p1: torch.Tensor, fract_mixing: float) -> torch.Tensor:
-    """
-    Spherical linear interpolation between two tensors.
-
-    Preserves the norm of the interpolated vector, which is important
-    for interpolating in latent spaces.
-
-    Args:
-        p0: First tensor
-        p1: Second tensor
-        fract_mixing: Mixing coefficient in [0, 1]
-                     0 returns p0, 1 returns p1
-
-    Returns:
-        Interpolated tensor
-    """
     # Determine dtype for recasting
     if p0.dtype == torch.float16:
         recast_to = 'fp16'
@@ -1049,23 +849,8 @@ def slerp(p0: torch.Tensor, p1: torch.Tensor, fract_mixing: float) -> torch.Tens
 
 
 def interpolate_linear(p0: torch.Tensor, p1: torch.Tensor, frac: float) -> torch.Tensor:
-    """
-    Linear interpolation between two tensors.
-
-    Args:
-        p0: First tensor
-        p1: Second tensor
-        frac: Mixing coefficient in [0, 1]
-
-    Returns:
-        Interpolated tensor
-    """
     return p0 + (p1 - p0) * frac
 
-
-# ============================================================================
-# Main script for testing
-# ============================================================================
 
 if __name__ == "__main__":
     print("=" * 70)
